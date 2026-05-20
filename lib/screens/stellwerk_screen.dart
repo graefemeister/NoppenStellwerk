@@ -36,7 +36,10 @@ class _StellwerkScreenState extends State<StellwerkScreen> {
   // --- FAHRSTRASSEN STATE ---
   bool _isRoutingMode = false; // Ist der "Stellen"-Modus aktiv?
   String? _routeStart;         // Gemerkter Startpunkt
+  String? _routeVia;          // Speichert das Zwischenziel
+  bool _expectingVia = false; // Steuert, ob der nächste Tap ein Zwischenziel ist
   Set<String> _activeRoute = {}; // Die aktuell leuchtende Fahrstraße
+  Map<String, int> _activeSwitchStates = {}; // Merkt sich die Zustände für den Painter
 
   @override
   void initState() {
@@ -45,81 +48,159 @@ class _StellwerkScreenState extends State<StellwerkScreen> {
   }
 
   void _handleTap(TapUpDetails details) {
-    final RenderBox? box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
-    final pos = box?.globalToLocal(details.globalPosition) ?? details.globalPosition;
-    final String key = "${(pos.dx / _snapSize).round()},${(pos.dy / _snapSize).round()}";
+    final RenderBox renderBox = _canvasKey.currentContext!.findRenderObject() as RenderBox;
+    final Offset localPos = renderBox.globalToLocal(details.globalPosition);
+    final int gridX = (localPos.dx / _snapSize).round();
+    final int gridY = (localPos.dy / _snapSize).round();
+    final String clickedKey = "$gridX,$gridY";
 
-    if (!widget.grid.containsKey(key)) return;
-    TrackTile tile = widget.grid[key]!;
+    if (!widget.grid.containsKey(clickedKey)) return;
 
-    // 1. Konfigurations-Modus
-    if (_configMode) {
-      if (tile.isSwitch) _showConfigDialog(key, tile);
-      return;
-    }
-
-    // 2. Fahrstraßen-Stell-Modus (Start-Ziel)
     if (_isRoutingMode) {
-      setState(() {
-        if (_routeStart == null) {
-          _routeStart = key; // Startpunkt gesetzt
-        } else if (_routeStart == key) {
-          _routeStart = null; // Klick auf sich selbst hebt Startpunkt auf
-        } else {
-          _calculateAndSetRoute(_routeStart!, key); // Ziel gewählt -> Berechnen!
+      if (_routeStart == null) {
+        // Start wählen
+        setState(() => _routeStart = clickedKey);
+      } 
+      else if (_expectingVia && _routeVia == null) {
+        // Zwischenziel wählen (verhindert, dass Start nochmal angetippt wird)
+        if (clickedKey == _routeStart) return; 
+        setState(() {
+          _routeVia = clickedKey;
+          _expectingVia = false; // Modus beenden, nächster Klick ist das Ziel
+        });
+      } 
+      else {
+        // Ziel wählen
+        if (clickedKey == _routeStart || clickedKey == _routeVia) {
+          // Klickt man aus Versehen nochmal auf Start/Via, brechen wir nicht ab, 
+          // sondern warten einfach weiter auf das echte Ziel.
+          return; 
         }
-      });
-      return;
+        _calculateAndSetRoute(clickedKey);
+      }
+    } else {
+      // Manueller Modus (Weichen stellen)
+      final tile = widget.grid[clickedKey]!;
+      if (tile.isSwitch) {
+        final newGrid = Map<String, TrackTile>.from(widget.grid);
+        int maxStates = tile.type == TileType.threeWay ? 3 : (tile.type == TileType.doubleSlip ? 4 : 2);
+        newGrid[clickedKey] = tile.copyWith(switchState: (tile.switchState + 1) % maxStates);
+        widget.onGridChanged(newGrid);
+      }
     }
-
-    // 3. Normaler manueller Modus (Einzelweichen stellen)
-    if (!tile.isSwitch) return;
-
-    // FAHRSTRASSENVERSCHLUSS: Verhindert manuelles Schalten von Weichen in aktiver Route
-    if (_activeRoute.contains(key)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Verschluss! Weiche ist in Fahrstraße gesperrt."), 
-          backgroundColor: Colors.orangeAccent,
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
-    }
-
-    // Wenn nicht gesperrt, normal umstellen
-    _cycleSwitchState(key, tile);
   }
 
-  void _calculateAndSetRoute(String start, String target) {
-    RouteResult? result = PathfindingService.findRoute(widget.grid, start, target);
+  void _calculateAndSetRoute(String targetKey) {
+    RouteResult? finalResult;
 
-    if (result != null) {
-      Map<String, TrackTile> newGrid = Map.from(widget.grid);
-      
-      // Schalte die Weichen in die errechnete Richtung
-      result.requiredSwitchStates.forEach((switchKey, newState) {
-        TrackTile updatedSwitch = newGrid[switchKey]!.copy();
-        updatedSwitch.switchState = newState;
-        newGrid[switchKey] = updatedSwitch;
+    if (_routeVia != null) {
+      // ROUTE MIT ZWISCHENZIEL: Zwei Teilstrecken berechnen
+      final segment1 = PathfindingService.findRoute(widget.grid, _routeStart!, _routeVia!);
+      final segment2 = PathfindingService.findRoute(widget.grid, _routeVia!, targetKey);
+
+      if (segment1 != null && segment2 != null) {
+        // 1. Pfade verknüpfen (Doppelung des Via-Keys entfernen)
+        List<String> combinedPath = List.from(segment1.pathKeys);
+        if (segment2.pathKeys.isNotEmpty) {
+          combinedPath.addAll(segment2.pathKeys.sublist(1));
+        }
+
+        // 2. NEU: Die Weichen für die GESAMTE verbundene Strecke in einem Rutsch berechnen!
+        Map<String, int> combinedSwitches = PathfindingService.recalculateSwitchStates(combinedPath, widget.grid);
+
+        finalResult = RouteResult(combinedPath, combinedSwitches);
+      }
+    } else {
+      // NORMALE ROUTE: Direkt von Start nach Ziel
+      finalResult = PathfindingService.findRoute(widget.grid, _routeStart!, targetKey);
+    }
+
+    if (finalResult != null) {
+      // Weichen im echten Grid umstellen
+      final newGrid = Map<String, TrackTile>.from(widget.grid);
+      finalResult.requiredSwitchStates.forEach((key, state) {
+        newGrid[key] = newGrid[key]!.copyWith(switchState: state);
       });
-
       widget.onGridChanged(newGrid);
 
       setState(() {
-        _activeRoute = result.pathKeys.toSet();
-        _isRoutingMode = false; // Modus beenden
+        _activeRoute = finalResult!.pathKeys.toSet();
+        _activeSwitchStates = finalResult.requiredSwitchStates;
+        _isRoutingMode = false;
         _routeStart = null;
+        _routeVia = null;
+        _expectingVia = false;
       });
-      
     } else {
+      // Fehler: Keine physikalische Verbindung möglich
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Kein physikalischer Weg gefunden!"), backgroundColor: Colors.redAccent),
+        const SnackBar(content: Text("Kein physikalischer Weg gefunden!"), backgroundColor: Colors.red),
       );
-      setState(() {
-        _routeStart = null; // Startpunkt zurücksetzen, aber im Modus bleiben
-      });
     }
+  }
+
+  // Baut den dynamischen Bedien-Button unten im Bildschirm um
+  Widget _buildRouteFab() {
+    if (!_isRoutingMode && _activeRoute.isEmpty) {
+      return FloatingActionButton.extended(
+        onPressed: () => setState(() => _isRoutingMode = true),
+        label: const Text("Fahrstraße stellen"),
+        icon: const Icon(Icons.gesture),
+      );
+    }
+
+    if (_isRoutingMode) {
+      if (_routeStart == null) {
+        return FloatingActionButton.extended(
+          onPressed: () => setState(() { _isRoutingMode = false; }),
+          label: const Text("Abbrechen (Startgleis wählen...)"),
+          icon: const Icon(Icons.close),
+          backgroundColor: Colors.orange,
+        );
+      }
+
+      // Start ist gewählt. Jetzt bieten wir die "Via"-Option an!
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_routeVia == null) ...[
+            FloatingActionButton.extended(
+              onPressed: () => setState(() => _expectingVia = !_expectingVia),
+              label: Text(_expectingVia ? "-> Tippe Zwischenziel..." : "+ Zwischenziel"),
+              icon: Icon(_expectingVia ? Icons.touch_app : Icons.add_location),
+              backgroundColor: _expectingVia ? Colors.lightBlue : Colors.blueGrey,
+            ),
+            const SizedBox(width: 12),
+          ],
+          FloatingActionButton.extended(
+            onPressed: () => setState(() {
+              _isRoutingMode = false;
+              _routeStart = null;
+              _routeVia = null;
+              _expectingVia = false;
+            }),
+            label: Text(_routeVia != null 
+                ? "Ziel wählen... (Via aktiv)" 
+                : "Ziel wählen..."),
+            icon: const Icon(Icons.flag),
+            backgroundColor: Colors.green,
+          ),
+        ],
+      );
+    }
+
+    // Fahrstraße aktiv -> Auflösen-Button
+    return FloatingActionButton.extended(
+      onPressed: () {
+        setState(() {
+          _activeRoute.clear();
+          _activeSwitchStates.clear();
+        });
+      },
+      label: const Text("Fahrstraße auflösen"),
+      icon: const Icon(Icons.delete_forever),
+      backgroundColor: Colors.redAccent,
+    );
   }
 
   void _cycleSwitchState(String key, TrackTile tile) {
@@ -136,50 +217,7 @@ class _StellwerkScreenState extends State<StellwerkScreen> {
     widget.onGridChanged(newGrid);
   }
 
-  // --- HILFS-WIDGET: Der dynamische Fahrstraßen-Button ---
-  Widget _buildRouteFab() {
-    // Zustand 1: Fahrstraße ist aktiv -> Knopf wird ROT (Auflösen)
-    if (_activeRoute.isNotEmpty) {
-      return FloatingActionButton.extended(
-        onPressed: () => setState(() {
-          _activeRoute.clear();
-          _routeStart = null;
-          _isRoutingMode = false;
-        }),
-        backgroundColor: Colors.redAccent,
-        icon: const Icon(Icons.clear, color: Colors.white),
-        label: const Text("Fahrstraße auflösen", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-      );
-    }
-
-    // Zustand 2: Wir sind mitten in der Start-Ziel-Auswahl -> Knopf wird ORANGE (Abbrechen)
-    if (_isRoutingMode) {
-       return FloatingActionButton.extended(
-        onPressed: () => setState(() {
-          _isRoutingMode = false;
-          _routeStart = null;
-        }),
-        backgroundColor: Colors.orangeAccent,
-        icon: const Icon(Icons.close, color: Colors.black),
-        label: Text(
-          _routeStart == null ? "Start wählen... (Abbrechen)" : "Ziel wählen... (Abbrechen)", 
-          style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)
-        ),
-      );
-    }
-
-    // Zustand 3: Normaler Betrieb -> Knopf ist GELB (Fahrstraße stellen)
-    return FloatingActionButton.extended(
-      onPressed: () => setState(() {
-        _isRoutingMode = true;
-        _routeStart = null;
-      }),
-      backgroundColor: Colors.yellowAccent,
-      icon: const Icon(Icons.route, color: Colors.black),
-      label: const Text("Fahrstraße stellen", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-    );
-  }
-
+ 
   // ... [Export, Import und ConfigDialog Methoden bleiben exakt gleich] ...
   void _exportGrid() {
     final Map<String, dynamic> exportData = widget.grid.map((k, v) => MapEntry(k, v.toJson()));
@@ -309,7 +347,9 @@ class _StellwerkScreenState extends State<StellwerkScreen> {
               grid: widget.grid, 
               selection: {}, 
               activeRoute: _activeRoute, 
-              routeStart: _routeStart,   
+              activeSwitchStates: _activeSwitchStates, 
+              routeStart: _routeStart,  
+              routeVia: _routeVia, 
               snapSize: _snapSize, tileSize: _tileSize,
               dragOffset: Offset.zero, buildPreview: [], isControlMode: true,
             ),

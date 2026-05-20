@@ -5,8 +5,10 @@ import '../models/track_tile.dart';
 class TrackPainter extends CustomPainter {
   final Map<String, TrackTile> grid;
   final Set<String> selection;
-  final Set<String> activeRoute; // NEU: Die aktive Fahrstraße
-  final String? routeStart;      // NEU: Der markierte Startpunkt
+  final Set<String> activeRoute; 
+  final Map<String, int> activeSwitchStates; // NEU: Stoppt das Loch!
+  final String? routeStart;      
+  final String? routeVia;        // NEU: Für das Zwischenziel
   final double snapSize, tileSize;
   final Offset dragOffset;
   final Offset? marqueeStart, marqueeEnd;
@@ -15,7 +17,10 @@ class TrackPainter extends CustomPainter {
 
   TrackPainter({
     required this.grid, required this.selection, 
-    this.activeRoute = const {}, this.routeStart, // Initialisierung
+    this.activeRoute = const {}, 
+    this.activeSwitchStates = const {}, // Initialisierung
+    this.routeStart, 
+    this.routeVia,                      // Initialisierung
     required this.snapSize, required this.tileSize,
     required this.dragOffset, this.marqueeStart, this.marqueeEnd, required this.buildPreview,
     this.isControlMode = false,
@@ -78,7 +83,7 @@ class TrackPainter extends CustomPainter {
       }
     });
 
-// --- FEHLTE: 1. Ausgewählte Gleise beim Verschieben (Pan) zeichnen ---
+// --- Ausgewählte Gleise beim Verschieben (Pan) zeichnen ---
     final paintSelected = Paint()..color = Colors.blueAccent..strokeWidth = 4..strokeCap = StrokeCap.round..style = PaintingStyle.stroke;
     for (String key in selection) {
       if (grid.containsKey(key)) {
@@ -86,7 +91,7 @@ class TrackPainter extends CustomPainter {
       }
     }
 
-    // --- FEHLTE: 2. Die grüne Vorschau beim Bauen neuer Gleise zeichnen ---
+    // --- Die grüne Vorschau beim Bauen neuer Gleise zeichnen ---
     final paintPreview = Paint()..color = Colors.greenAccent.withOpacity(0.6)..strokeWidth = 4..strokeCap = StrokeCap.round..style = PaintingStyle.stroke;
     for (var entry in buildPreview) {
       _drawTileAt(canvas, entry.key, entry.value, paintPreview, paintDimmed, Offset.zero);
@@ -117,6 +122,27 @@ class TrackPainter extends CustomPainter {
         tp.paint(canvas, Offset(x + snappedDrag.dx + 5, y + snappedDrag.dy - 18));
       }
     });
+
+    // --- SCHICHT 3: Startpunkt und Zwischenziel (Kräftiges Leuchten) ---
+    if (!hasActiveRoute) {
+      if (routeStart != null) {
+        final coords = routeStart!.split(",");
+        canvas.drawCircle(
+          Offset(double.parse(coords[0]) * snapSize, double.parse(coords[1]) * snapSize), 
+          18, // Etwas größer gemacht
+          Paint()..color = Colors.greenAccent.withOpacity(0.8)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6)
+        );
+      }
+      
+      if (routeVia != null) {
+        final coords = routeVia!.split(",");
+        canvas.drawCircle(
+          Offset(double.parse(coords[0]) * snapSize, double.parse(coords[1]) * snapSize), 
+          18, 
+          Paint()..color = Colors.orangeAccent.withOpacity(0.9)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6)
+        );
+      }
+    }
   }
 
   void _drawTileAt(Canvas canvas, String key, TrackTile tile, Paint active, Paint inactive, Offset offset) {
@@ -124,10 +150,13 @@ class TrackPainter extends CustomPainter {
     final double x = double.parse(coords[0]) * snapSize;
     final double y = double.parse(coords[1]) * snapSize;
 
+    // DAS IST DER MAGISCHE FIX GEGEN DAS LOCH:
+    int effectiveState = activeSwitchStates.containsKey(key) ? activeSwitchStates[key]! : tile.switchState;
+
     canvas.save();
     canvas.translate(x + offset.dx, y + offset.dy);
     canvas.rotate(tile.rotation * math.pi / 4);
-    _drawGeometry(canvas, tile.type, tile.switchState, active, inactive, tile.rotation % 2 != 0);
+    _drawGeometry(canvas, tile.type, effectiveState, active, inactive, tile.rotation % 2 != 0);
     canvas.restore();
   }
 

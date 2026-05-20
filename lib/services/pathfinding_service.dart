@@ -1,4 +1,5 @@
 import 'dart:collection';
+import 'dart:math' as math;
 import '../models/track_tile.dart';
 
 class RouteResult {
@@ -9,7 +10,6 @@ class RouteResult {
 }
 
 class PathfindingService {
-  // Sucht den kürzesten Weg vom Start zum Ziel über aneinandergrenzende Schienen
   static RouteResult? findRoute(Map<String, TrackTile> grid, String startKey, String targetKey) {
     if (!grid.containsKey(startKey) || !grid.containsKey(targetKey)) return null;
 
@@ -17,7 +17,6 @@ class PathfindingService {
     Set<String> visited = {startKey};
 
     queue.add([startKey]);
-
     List<String>? foundPath;
 
     while (queue.isNotEmpty) {
@@ -29,7 +28,7 @@ class PathfindingService {
         break;
       }
 
-      for (String neighbor in _getNeighbors(currentKey, grid)) {
+      for (String neighbor in _getValidNeighbors(currentKey, grid)) {
         if (!visited.contains(neighbor)) {
           visited.add(neighbor);
           List<String> newPath = List.from(path)..add(neighbor);
@@ -40,61 +39,153 @@ class PathfindingService {
 
     if (foundPath == null) return null;
 
-    // Weg gefunden! Jetzt berechnen wir, wie die Weichen auf dem Weg stehen müssen.
     Map<String, int> requiredSwitchStates = {};
     for (int i = 0; i < foundPath.length - 1; i++) {
       String current = foundPath[i];
-      String next = foundPath[i + 1];
       TrackTile tile = grid[current]!;
 
       if (tile.isSwitch) {
-        // Ein stark vereinfachter Ansatz: Weichen schalten standardmäßig um (State 1), 
-        // wenn der Weg nicht "geradeaus" weitergeht.
-        // In einem voll ausgewachsenen Simulator würde man hier den Winkel zwischen current und next prüfen.
-        int state = _calculateSwitchState(current, next, tile);
-        requiredSwitchStates[current] = state;
+        String prev = i > 0 ? foundPath[i - 1] : "";
+        String next = foundPath[i + 1];
+        requiredSwitchStates[current] = _calculateSwitchState(prev, current, next, tile);
       }
     }
 
     return RouteResult(foundPath, requiredSwitchStates);
   }
 
-  // Sucht alle horizontalen, vertikalen und diagonalen Nachbarn, auf denen eine Schiene liegt
-    static List<String> _getNeighbors(String key, Map<String, TrackTile> grid) {
-    List<String> neighbors = [];
-    var parts = key.split(',');
-    int x = int.parse(parts[0]);
-    int y = int.parse(parts[1]);
+  static Map<String, int> recalculateSwitchStates(List<String> combinedPath, Map<String, TrackTile> grid) {
+    Map<String, int> requiredStates = {};
+    for (int i = 0; i < combinedPath.length - 1; i++) {
+      String current = combinedPath[i];
+      TrackTile tile = grid[current]!;
 
-    // Wir prüfen alle Felder im Umkreis von -2 bis +2 Einheiten.
-    // Dadurch findet der Algorithmus Halbschienen (Distanz 1) und ganze Schienen (Distanz 2).
+      if (tile.isSwitch) {
+        String prev = i > 0 ? combinedPath[i - 1] : "";
+        String next = combinedPath[i + 1];
+        requiredStates[current] = _calculateSwitchState(prev, current, next, tile);
+      }
+    }
+    return requiredStates;
+  }
+
+  // Physikalische Ausgänge (0=Ost, 2=Süd, 4=West, 6=Nord, ungerade=Diagonal)
+  static List<int> _getExits(TrackTile tile) {
+    int r = tile.rotation;
+    switch (tile.type) {
+      case TileType.straight:
+      case TileType.halfStraight: 
+        return [r % 8, (r + 4) % 8];
+      case TileType.crossing: 
+        return [r % 8, (r + 2) % 8, (r + 4) % 8, (r + 6) % 8];
+      case TileType.switchLeft: 
+        return [(r + 4) % 8, r % 8, (r + 7) % 8]; // Wurzel, Gerade, Links
+      case TileType.switchRight: 
+        return [(r + 4) % 8, r % 8, (r + 1) % 8]; // Wurzel, Gerade, Rechts
+      case TileType.threeWay: 
+        return [(r + 4) % 8, r % 8, (r + 7) % 8, (r + 1) % 8];
+      case TileType.doubleSlip: 
+        return [0, 1, 2, 3, 4, 5, 6, 7]; 
+      case TileType.buffer: 
+        return [(r + 4) % 8];
+    }
+  }
+
+  // HILFSFUNKTION: Das Herzstück der "Verzeihenden Topologie"
+  // Gibt Gleisen eine Fang-Toleranz von +/- 45 Grad, um das harte Raster zu umgehen!
+  static bool _hasFuzzyExit(List<int> exits, int targetDir) {
+    for (int e in exits) {
+      if (e == targetDir || e == (targetDir + 1) % 8 || e == (targetDir + 7) % 8) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static List<String> _getValidNeighbors(String key, Map<String, TrackTile> grid) {
+    List<String> neighbors = [];
+    TrackTile tileA = grid[key]!;
+    var pA = key.split(',');
+    int ax = int.parse(pA[0]); 
+    int ay = int.parse(pA[1]);
+
+    List<int> exitsA = _getExits(tileA);
+
     for (int dx = -2; dx <= 2; dx++) {
       for (int dy = -2; dy <= 2; dy++) {
-        // Das eigene Feld überspringen
         if (dx == 0 && dy == 0) continue;
         
-        String nKey = "${x + dx},${y + dy}";
+        String nKey = "${ax + dx},${ay + dy}";
         if (grid.containsKey(nKey)) {
-          neighbors.add(nKey);
+          TrackTile tileB = grid[nKey]!;
+          List<int> exitsB = _getExits(tileB);
+          
+          int dirAB = _getClosestDirection(dx, dy);
+          int dirBA = (dirAB + 4) % 8; 
+
+          // DER MAGISCHE FIX:
+          // 1. Das && (UND) stoppt das Schummeln an den Weichen-Außenseiten.
+          // 2. Das _hasFuzzyExit erlaubt deinen Diagonalen aber das Einrasten.
+          if (_hasFuzzyExit(exitsA, dirAB) && _hasFuzzyExit(exitsB, dirBA)) {
+            neighbors.add(nKey);
+          }
         }
       }
     }
     return neighbors;
   }
 
-  // Errechnet den Weichenstatus basierend auf der Abbiege-Richtung
-  static int _calculateSwitchState(String currentKey, String nextKey, TrackTile tile) {
+  static int _calculateSwitchState(String prevKey, String currentKey, String nextKey, TrackTile tile) {
     var currParts = currentKey.split(',');
-    var nextParts = nextKey.split(',');
-    int dx = int.parse(nextParts[0]) - int.parse(currParts[0]);
-    int dy = int.parse(nextParts[1]) - int.parse(currParts[1]);
+    int cx = int.parse(currParts[0]);
+    int cy = int.parse(currParts[1]);
 
-    // Wenn sich X UND Y verändern, geht der Weg über eine Kurve / Diagonale.
-    // Daher schalten wir die Weiche auf Abzweigend (State 1).
-    if (dx != 0 && dy != 0) {
-      return 1; 
+    var nextParts = nextKey.split(',');
+    int nx = int.parse(nextParts[0]);
+    int ny = int.parse(nextParts[1]);
+
+    int outDir = _getClosestDirection(nx - cx, ny - cy);
+    int relOut = (outDir - tile.rotation + 8) % 8;
+    
+    int relIn = -1;
+    if (prevKey.isNotEmpty) {
+      var prevParts = prevKey.split(',');
+      int px = int.parse(prevParts[0]);
+      int py = int.parse(prevParts[1]);
+      int inDir = _getClosestDirection(px - cx, py - cy); 
+      relIn = (inDir - tile.rotation + 8) % 8;
     }
-    // Geht der Weg nur horizontal oder vertikal, bleibt die Weiche auf Gerade (State 0).
-    return 0;
+
+    bool uses(int dir) => relOut == dir || relIn == dir;
+
+    switch (tile.type) {
+      case TileType.switchLeft:
+        if (uses(5) || uses(6) || uses(7)) return 1; // Abzweig Links
+        return 0; 
+      case TileType.switchRight:
+        if (uses(1) || uses(2) || uses(3)) return 1; // Abzweig Rechts
+        return 0; 
+      case TileType.threeWay:
+        if (uses(5) || uses(6) || uses(7)) return 1; // Links
+        if (uses(1) || uses(2) || uses(3)) return 2; // Rechts
+        return 0;
+      case TileType.doubleSlip:
+        bool w = uses(3) || uses(4) || uses(5);
+        bool e = uses(7) || uses(0) || uses(1);
+        bool n = uses(5) || uses(6) || uses(7);
+        bool s = uses(1) || uses(2) || uses(3);
+        
+        if (w && s) return 2;
+        if (e && n) return 3;
+        if (n && s) return 1;
+        return 0;
+      default:
+        return 0;
+    }
+  }
+
+  static int _getClosestDirection(int dx, int dy) {
+    double angle = math.atan2(dy, dx);
+    return ((angle / (math.pi / 4)).round() + 8) % 8;
   }
 }

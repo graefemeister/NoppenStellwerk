@@ -33,6 +33,24 @@ class TrackTile {
     labelColor: labelColor,
   );
 
+  TrackTile copyWith({
+    TileType? type,
+    int? rotation,
+    int? switchState,
+    List<String>? actuatorPorts,
+    String? label,
+    int? labelColor,
+  }) {
+    return TrackTile(
+      type: type ?? this.type,
+      rotation: rotation ?? this.rotation,
+      switchState: switchState ?? this.switchState,
+      actuatorPorts: actuatorPorts ?? this.actuatorPorts,
+      label: label ?? this.label,
+      labelColor: labelColor ?? this.labelColor,
+    );
+  }
+
   bool get isSwitch => actuatorPorts.isNotEmpty;
 
   // NEU: Wandelt die Kachel in ein Map-Format um
@@ -59,3 +77,4 @@ class TrackTile {
     );
   }
 }
+
